@@ -6,21 +6,26 @@ package tls
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto"
 	"crypto/hmac"
 	"crypto/rsa"
 	"errors"
 	"fmt"
 	"hash"
+	"io"
 	"sync/atomic"
 	"time"
+
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 )
 
 type clientHandshakeStateTLS13 struct {
 	c           *Conn
 	serverHello *serverHelloMsg
 	hello       *clientHelloMsg
-	ecdheParams map[CurveID]ecdheParameters
+	ecdheParams ecdheParameters
 
 	session     *ClientSessionState
 	earlySecret []byte
@@ -33,8 +38,6 @@ type clientHandshakeStateTLS13 struct {
 	transcript    hash.Hash
 	masterSecret  []byte
 	trafficSecret []byte // client_application_traffic_secret_0
-
-	certCompAlgs []CertCompressionAlgo
 
 	uconn *UConn // [UTLS]
 }
@@ -208,22 +211,26 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 			break
 		}
 	}
-	if !curveOK || !utlsSupportedGroups[curveID] {
+	if !curveOK {
 		c.sendAlert(alertIllegalParameter)
 		return errors.New("tls: server selected unsupported group")
 	}
-	if _, ok := hs.ecdheParams[curveID]; !ok {
+	if hs.ecdheParams.CurveID() == curveID {
 		c.sendAlert(alertIllegalParameter)
 		return errors.New("tls: server sent an unnecessary HelloRetryRequest message")
 	}
-
+	if _, ok := curveForCurveID(curveID); curveID != X25519 && !ok {
+		c.sendAlert(alertInternalError)
+		return errors.New("tls: CurvePreferences includes unsupported curve")
+	}
 	params, err := generateECDHEParameters(c.config.rand(), curveID)
 	if err != nil {
 		c.sendAlert(alertInternalError)
 		return err
 	}
-	hs.ecdheParams[curveID] = params
+	hs.ecdheParams = params
 	hs.hello.keyShares = []keyShare{{group: curveID, data: params.PublicKey()}}
+
 	hs.hello.cookie = hs.serverHello.cookie
 
 	hs.hello.raw = nil
@@ -314,7 +321,7 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 	// [UTLS SECTION ENDS]
 
 	hs.transcript.Write(hs.hello.marshal())
-	if _, err = c.writeRecord(recordTypeHandshake, hs.hello.marshal()); err != nil {
+	if _, err := c.writeRecord(recordTypeHandshake, hs.hello.marshal()); err != nil {
 		return err
 	}
 
@@ -359,7 +366,7 @@ func (hs *clientHandshakeStateTLS13) processServerHello() error {
 		c.sendAlert(alertIllegalParameter)
 		return errors.New("tls: server did not send a key share")
 	}
-	if _, ok := hs.ecdheParams[hs.serverHello.serverShare.group]; !ok {
+	if hs.serverHello.serverShare.group != hs.ecdheParams.CurveID() {
 		c.sendAlert(alertIllegalParameter)
 		return errors.New("tls: server selected unsupported group")
 	}
@@ -395,8 +402,7 @@ func (hs *clientHandshakeStateTLS13) processServerHello() error {
 func (hs *clientHandshakeStateTLS13) establishHandshakeKeys() error {
 	c := hs.c
 
-	ecdheParams := hs.ecdheParams[hs.serverHello.serverShare.group]
-	sharedKey := ecdheParams.SharedKey(hs.serverHello.serverShare.data)
+	sharedKey := hs.ecdheParams.SharedKey(hs.serverHello.serverShare.data)
 	if sharedKey == nil {
 		c.sendAlert(alertIllegalParameter)
 		return errors.New("tls: invalid server key share")
@@ -483,41 +489,39 @@ func (hs *clientHandshakeStateTLS13) readServerCertificate() error {
 		}
 	}
 
-	var (
-		certMsg    *certificateMsgTLS13
-		rawCertMsg []byte
-	)
-	switch v := msg.(type) {
-	case *certificateMsgTLS13:
-		certMsg, rawCertMsg = v, v.marshal()
-	case *compressedCertificateMsg:
-		var algOk bool
-		for _, alg := range hs.certCompAlgs {
-			if alg == v.algorithm {
-				algOk = true
-				break
+	// [UTLS SECTION BEGINS]
+	receivedCompressedCert := false
+	// Check to see if we advertised any compression algorithms
+	if hs.uconn != nil && len(hs.uconn.certCompressionAlgs) > 0 {
+		// Check to see if the message is a compressed certificate message, otherwise move on.
+		compressedCertMsg, ok := msg.(*compressedCertificateMsg)
+		if ok {
+			receivedCompressedCert = true
+			hs.transcript.Write(compressedCertMsg.marshal())
+
+			msg, err = hs.decompressCert(*compressedCertMsg)
+			if err != nil {
+				return fmt.Errorf("tls: failed to decompress certificate message: %w", err)
 			}
 		}
-		if !algOk {
-			c.sendAlert(alertUnexpectedMessage)
-			return unexpectedMessageError(certMsg, msg)
-		}
-		certMsg, err = v.toCertificateMsg()
-		if err != nil {
-			c.sendAlert(alertBadCertificate)
-			return err
-		}
-		rawCertMsg = v.marshal()
-	default:
+	}
+	// [UTLS SECTION ENDS]
+
+	certMsg, ok := msg.(*certificateMsgTLS13)
+	if !ok {
 		c.sendAlert(alertUnexpectedMessage)
 		return unexpectedMessageError(certMsg, msg)
 	}
-
 	if len(certMsg.certificate.Certificate) == 0 {
 		c.sendAlert(alertDecodeError)
 		return errors.New("tls: received empty certificates message")
 	}
-	hs.transcript.Write(rawCertMsg)
+	// [UTLS SECTION BEGINS]
+	// Previously, this was simply 'hs.transcript.Write(certMsg.marshal())' (without the if).
+	if !receivedCompressedCert {
+		hs.transcript.Write(certMsg.marshal())
+	}
+	// [UTLS SECTION ENDS]
 
 	c.scts = certMsg.certificate.SignedCertificateTimestamps
 	c.ocspResponse = certMsg.certificate.OCSPStaple
@@ -713,6 +717,80 @@ func (hs *clientHandshakeStateTLS13) sendClientFinished() error {
 
 	return nil
 }
+
+// [UTLS SECTION BEGINS]
+func (hs *clientHandshakeStateTLS13) decompressCert(m compressedCertificateMsg) (*certificateMsgTLS13, error) {
+	var (
+		decompressed io.Reader
+		compressed   = bytes.NewReader(m.compressedCertificateMessage)
+		c            = hs.c
+	)
+
+	// Check to see if the peer responded with an algorithm we advertised.
+	supportedAlg := false
+	for _, alg := range hs.uconn.certCompressionAlgs {
+		if m.algorithm == uint16(alg) {
+			supportedAlg = true
+		}
+	}
+	if !supportedAlg {
+		c.sendAlert(alertBadCertificate)
+		return nil, fmt.Errorf("unadvertised algorithm (%d)", m.algorithm)
+	}
+
+	switch CertCompressionAlgo(m.algorithm) {
+	case CertCompressionBrotli:
+		decompressed = brotli.NewReader(compressed)
+
+	case CertCompressionZlib:
+		rc, err := zlib.NewReader(compressed)
+		if err != nil {
+			c.sendAlert(alertBadCertificate)
+			return nil, fmt.Errorf("failed to open zlib reader: %w", err)
+		}
+		defer rc.Close()
+		decompressed = rc
+
+	case CertCompressionZstd:
+		rc, err := zstd.NewReader(compressed)
+		if err != nil {
+			c.sendAlert(alertBadCertificate)
+			return nil, fmt.Errorf("failed to open zstd reader: %w", err)
+		}
+		defer rc.Close()
+		decompressed = rc
+
+	default:
+		c.sendAlert(alertBadCertificate)
+		return nil, fmt.Errorf("unsupported algorithm (%d)", m.algorithm)
+	}
+
+	rawMsg := make([]byte, m.uncompressedLength+4) // +4 for message type and uint24 length field
+	rawMsg[0] = typeCertificate
+	rawMsg[1] = uint8(m.uncompressedLength >> 16)
+	rawMsg[2] = uint8(m.uncompressedLength >> 8)
+	rawMsg[3] = uint8(m.uncompressedLength)
+
+	n, err := decompressed.Read(rawMsg[4:])
+	if err != nil {
+		c.sendAlert(alertBadCertificate)
+		return nil, err
+	}
+	if n < len(rawMsg)-4 {
+		// If, after decompression, the specified length does not match the actual length, the party
+		// receiving the invalid message MUST abort the connection with the "bad_certificate" alert.
+		// https://datatracker.ietf.org/doc/html/rfc8879#section-4
+		c.sendAlert(alertBadCertificate)
+		return nil, fmt.Errorf("decompressed len (%d) does not match specified len (%d)", n, m.uncompressedLength)
+	}
+	certMsg := new(certificateMsgTLS13)
+	if !certMsg.unmarshal(rawMsg) {
+		return nil, c.sendAlert(alertUnexpectedMessage)
+	}
+	return certMsg, nil
+}
+
+// [UTLS SECTION ENDS]
 
 func (c *Conn) handleNewSessionTicket(msg *newSessionTicketMsgTLS13) error {
 	if !c.isClient {

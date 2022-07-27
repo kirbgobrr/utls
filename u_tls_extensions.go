@@ -49,29 +49,43 @@ type SNIExtension struct {
 
 func (e *SNIExtension) writeToUConn(uc *UConn) error {
 	uc.config.ServerName = e.ServerName
-	uc.HandshakeState.Hello.ServerName = e.ServerName
+	hostName := hostnameInSNI(e.ServerName)
+	uc.HandshakeState.Hello.ServerName = hostName
+
 	return nil
 }
 
 func (e *SNIExtension) Len() int {
-	return 4 + 2 + 1 + 2 + len(e.ServerName)
+	// Literal IP addresses, absolute FQDNs, and empty strings are not permitted as SNI values.
+	// See RFC 6066, Section 3.
+	hostName := hostnameInSNI(e.ServerName)
+	if len(hostName) == 0 {
+		return 0
+	}
+	return 4 + 2 + 1 + 2 + len(hostName)
 }
 
 func (e *SNIExtension) Read(b []byte) (int, error) {
+	// Literal IP addresses, absolute FQDNs, and empty strings are not permitted as SNI values.
+	// See RFC 6066, Section 3.
+	hostName := hostnameInSNI(e.ServerName)
+	if len(hostName) == 0 {
+		return 0, io.EOF
+	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
 	// RFC 3546, section 3.1
 	b[0] = byte(extensionServerName >> 8)
 	b[1] = byte(extensionServerName)
-	b[2] = byte((len(e.ServerName) + 5) >> 8)
-	b[3] = byte((len(e.ServerName) + 5))
-	b[4] = byte((len(e.ServerName) + 3) >> 8)
-	b[5] = byte(len(e.ServerName) + 3)
+	b[2] = byte((len(hostName) + 5) >> 8)
+	b[3] = byte((len(hostName) + 5))
+	b[4] = byte((len(hostName) + 3) >> 8)
+	b[5] = byte(len(hostName) + 3)
 	// b[6] Server Name Type: host_name (0)
-	b[7] = byte(len(e.ServerName) >> 8)
-	b[8] = byte(len(e.ServerName))
-	copy(b[9:], []byte(e.ServerName))
+	b[7] = byte(len(hostName) >> 8)
+	b[8] = byte(len(hostName))
+	copy(b[9:], []byte(hostName))
 	return e.Len(), io.EOF
 }
 
@@ -496,6 +510,51 @@ func (e *UtlsPaddingExtension) Read(b []byte) (int, error) {
 	b[1] = byte(utlsExtensionPadding)
 	b[2] = byte(e.PaddingLen >> 8)
 	b[3] = byte(e.PaddingLen)
+	return e.Len(), io.EOF
+}
+
+// UtlsCompressCertExtension is only implemented client-side, for server certificates. Alternate
+// certificate message formats (https://datatracker.ietf.org/doc/html/rfc7250) are not supported.
+//
+// See https://datatracker.ietf.org/doc/html/rfc8879#section-3
+type UtlsCompressCertExtension struct {
+	Algorithms []CertCompressionAlgo
+}
+
+func (e *UtlsCompressCertExtension) writeToUConn(uc *UConn) error {
+	uc.certCompressionAlgs = e.Algorithms
+	return nil
+}
+
+func (e *UtlsCompressCertExtension) Len() int {
+	return 4 + 1 + (2 * len(e.Algorithms))
+}
+
+func (e *UtlsCompressCertExtension) Read(b []byte) (int, error) {
+	if len(b) < e.Len() {
+		return 0, io.ErrShortBuffer
+	}
+	b[0] = byte(utlsExtensionCompressCertificate >> 8)
+	b[1] = byte(utlsExtensionCompressCertificate & 0xff)
+
+	extLen := 2 * len(e.Algorithms)
+	if extLen > 255 {
+		return 0, errors.New("too many certificate compression methods")
+	}
+
+	// Extension data length.
+	b[2] = byte((extLen + 1) >> 8)
+	b[3] = byte((extLen + 1) & 0xff)
+
+	// Methods length.
+	b[4] = byte(extLen)
+
+	i := 5
+	for _, compMethod := range e.Algorithms {
+		b[i] = byte(compMethod >> 8)
+		b[i+1] = byte(compMethod)
+		i += 2
+	}
 	return e.Len(), io.EOF
 }
 

@@ -31,7 +31,12 @@ type UConn struct {
 
 	greaseSeed [ssl_grease_last_index]uint16
 
-	extCompressCerts bool
+	omitSNIExtension bool
+
+	// certCompressionAlgs represents the set of advertised certificate compression
+	// algorithms, as specified in the ClientHello. This is only relevant client-side, for the
+	// server certificate. All other forms of certificate compression are unsupported.
+	certCompressionAlgs []CertCompressionAlgo
 }
 
 // UClient returns a new uTLS client, with behavior depending on clientHelloID.
@@ -72,13 +77,16 @@ func (uconn *UConn) BuildHandshakeState() error {
 		}
 
 		uconn.HandshakeState.Hello = hello.getPublicPtr()
-		uconn.HandshakeState.State13.EcdheParams = ecdheParamMapToPublic(ecdheParams)
+		uconn.HandshakeState.State13.EcdheParams = ecdheParams
 		uconn.HandshakeState.C = uconn.Conn
 	} else {
 		if !uconn.ClientHelloBuilt {
 			err := uconn.applyPresetByID(uconn.ClientHelloID)
 			if err != nil {
 				return err
+			}
+			if uconn.omitSNIExtension {
+				uconn.removeSNIExtension()
 			}
 		}
 
@@ -162,6 +170,26 @@ func (uconn *UConn) SetSNI(sni string) {
 			sniExt.ServerName = hname
 		}
 	}
+}
+
+// RemoveSNIExtension removes SNI from the list of extensions sent in ClientHello
+// It returns an error when used with HelloGolang ClientHelloID
+func (uconn *UConn) RemoveSNIExtension() error {
+	if uconn.ClientHelloID == HelloGolang {
+		return fmt.Errorf("Cannot call RemoveSNIExtension on a UConn with a HelloGolang ClientHelloID")
+	}
+	uconn.omitSNIExtension = true
+	return nil
+}
+
+func (uconn *UConn) removeSNIExtension() {
+	filteredExts := make([]TLSExtension, 0, len(uconn.Extensions))
+	for _, e := range uconn.Extensions {
+		if _, ok := e.(*SNIExtension); !ok {
+			filteredExts = append(filteredExts, e)
+		}
+	}
+	uconn.Extensions = filteredExts
 }
 
 // Handshake runs the client handshake using given clientHandshakeState
